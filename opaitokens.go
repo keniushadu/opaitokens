@@ -2,26 +2,38 @@ package opaitokens
 
 import (
 	"bytes"
+	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"github.com/fireinrain/opaitokens/auth"
+	"github.com/fireinrain/opaitokens/fakeopen"
 	"github.com/fireinrain/opaitokens/model"
 	"log"
 	"net/http"
+	"net/http/cookiejar"
 	"regexp"
 	"strings"
+	"time"
 )
 
 const OpenaiTokenBaseUrl = "https://auth0.openai.com/oauth/token"
 
+// DefaultSharedTokenUniqueName depreacted because it's used for me testing
+const DefaultSharedTokenUniqueName = "fireinrain"
+
+const PooledTokenAccountsLimit = 100
+
 type OpaiTokens struct {
-	Email          string                     `json:"email"`
-	Password       string                     `json:"password"`
-	OpenaiToken    model.OpenaiToken          `json:"openaiToken"`
-	RefreshedToken model.OpenaiRefreshedToken `json:"refreshedToken"`
+	Email            string                     `json:"email"`
+	Password         string                     `json:"password"`
+	MFA              string                     `json:"mfa"`
+	OpenaiToken      model.OpenaiToken          `json:"openaiToken"`
+	RefreshedToken   model.OpenaiRefreshedToken `json:"refreshedToken"`
+	UseFakeopenProxy bool                       `json:"useFakeopenProxy"`
 }
 
-func NewOpaiTokens(email string, password string) *OpaiTokens {
+func NewOpaiTokens(email string, password string, useFakeOpenProxy bool) *OpaiTokens {
 	if email == "" {
 		log.Fatal("email cannot be empty")
 	}
@@ -29,15 +41,32 @@ func NewOpaiTokens(email string, password string) *OpaiTokens {
 		log.Fatal("password cannot be empty")
 	}
 	return &OpaiTokens{
-		Email:          email,
-		Password:       password,
-		OpenaiToken:    model.OpenaiToken{},
-		RefreshedToken: model.OpenaiRefreshedToken{},
+		Email:            email,
+		Password:         password,
+		MFA:              "",
+		OpenaiToken:      model.OpenaiToken{},
+		RefreshedToken:   model.OpenaiRefreshedToken{},
+		UseFakeopenProxy: useFakeOpenProxy,
 	}
 }
 
+func NewOpaiTokensWithMFA(email string, password string, mfa string, useFakeOpenProxy bool) *OpaiTokens {
+	tokens := NewOpaiTokens(email, password, useFakeOpenProxy)
+	tokens.MFA = mfa
+	return tokens
+}
+
 func (receiver *OpaiTokens) FetchToken() *OpaiTokens {
-	auth := auth.NewAuth0(receiver.Email, receiver.Password, false)
+	auth := auth.NewAuth0(receiver.Email, receiver.Password, receiver.MFA, false)
+	if receiver.UseFakeopenProxy {
+		s, err := auth.Auth(false)
+		if err != nil {
+			fmt.Printf("use fakeopen proxy for auth failed: %s", err)
+		}
+		receiver.RefreshedToken.AccessToken = auth.GetRefreshToken()
+		receiver.OpenaiToken.AccessToken = s
+		return receiver
+	}
 	codeAndUrl, err := auth.AuthForCodeUrl()
 	if err != nil {
 		fmt.Println("Error:", err)
@@ -124,6 +153,17 @@ func (reciver *OpaiTokens) refreshToken(refreshToken string) (model.OpenaiRefres
 }
 
 func makePostRequest(url string, jsonData []byte) (resp string, error error) {
+	var jar, _ = cookiejar.New(nil)
+
+	tr := &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		Proxy:           http.ProxyFromEnvironment,
+	}
+	client := &http.Client{
+		Timeout:   time.Second * 100,
+		Transport: tr,
+		Jar:       jar,
+	}
 	// 创建请求
 	request, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
 	if err != nil {
@@ -134,7 +174,7 @@ func makePostRequest(url string, jsonData []byte) (resp string, error error) {
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/111.0.0.0 Safari/537.36")
 	// 发送请求
-	response, err := http.DefaultClient.Do(request)
+	response, err := client.Do(request)
 	if err != nil {
 		fmt.Println("POST request error:", err)
 		return "", err
@@ -154,4 +194,345 @@ func getLoginUrl(codeChallenge string) string {
 	//fmt.Println("Modified URL:", newURL)
 	//fmt.Println(escape)
 	return newURL
+}
+
+type FakeOpenTokens struct{}
+
+type OpenaiAccount struct {
+	Email    string `json:"email"`
+	Password string `json:"password"`
+	MFA      string `json:"mfa"`
+}
+
+type RenewResult struct {
+	RenewCount   int  `json:"renew_count"`
+	RenewSuccess bool `json:"renew_success"`
+}
+
+// FetchSharedToken
+//
+//	@Description: 通过官方账号获取shared token
+//	@receiver receiver
+//	@param openaiAccount
+//	@param uniqueName
+//	@return fakeopen.SharedToken
+//	@return error
+func (receiver *FakeOpenTokens) FetchSharedToken(openaiAccount OpenaiAccount, uniqueName string) (fakeopen.SharedToken, error) {
+
+	tokens := NewOpaiTokensWithMFA(openaiAccount.Email, openaiAccount.Password, openaiAccount.MFA, true)
+	token := tokens.FetchToken()
+	//fmt.Printf("token info: %v\n", token)
+	accessToken := token.OpenaiToken.AccessToken
+	// use the access token
+	fmt.Println("current openai account: ", openaiAccount.Email)
+	fmt.Printf("fetched access token: %v \n", accessToken)
+
+	platform := fakeopen.NewAiFakeOpenPlatform()
+	req := fakeopen.SharedTokenReq{
+		UniqueName:        uniqueName,
+		AccessToken:       accessToken,
+		ExpiresIn:         0,
+		SiteLimit:         "",
+		ShowConversations: true,
+	}
+	shareToken, err := platform.GetSharedToken(req)
+	if err != nil {
+		return shareToken, errors.New("error getting shared token: " + err.Error())
+	}
+	return shareToken, nil
+}
+
+// RenewSharedToken
+// shared token = hash(unique_name + access token uid)
+//
+//	@Description: 刷新所有账号的fk(在14天到期之前主动刷新账号池的fk来确保pk保持不变)
+//	@receiver receiver
+//	@param openaiAccounts
+//	@return RenewResult
+//	@return error
+func (receiver *FakeOpenTokens) RenewSharedToken(openaiAccounts []OpenaiAccount, uniqueName string) (RenewResult, error) {
+	result := RenewResult{
+		RenewCount:   0,
+		RenewSuccess: false,
+	}
+	if len(openaiAccounts) <= 0 {
+		log.Fatal("openai account is empty")
+	}
+	var er error
+	for index, account := range openaiAccounts {
+		fmt.Printf("renew shared token progress...%v/%v. ", index+1, len(openaiAccounts))
+		_, err := receiver.FetchSharedToken(account, uniqueName)
+		if err == nil {
+			result.RenewCount += 1
+		} else {
+			er = err
+		}
+		time.Sleep(time.Second * 15)
+	}
+	//全部成功刷新
+	if len(openaiAccounts) == result.RenewCount {
+		result.RenewSuccess = true
+	}
+	return result, er
+}
+
+// FetchSharedTokenWithRefreshToken
+//
+//	@Description: 使用openai官方的refresh token来获取fakeopen的share token
+//	@receiver receiver
+//	@param openaiAccountEmail
+//	@param openaiRefreshToken
+//	@param uniqueName
+//	@return fakeopen.SharedToken
+//	@return error
+func (receiver FakeOpenTokens) FetchSharedTokenWithRefreshToken(openaiAccountEmail string, openaiRefreshToken string, uniqueName string) (fakeopen.SharedToken, error) {
+	tokens := OpaiTokens{}
+	token, err2 := tokens.refreshToken(openaiRefreshToken)
+	if err2 != nil {
+		fmt.Println("refresh token failed: ", err2.Error())
+		return fakeopen.SharedToken{}, err2
+	}
+	// use the access token
+	fmt.Println("current openai account: ", openaiAccountEmail)
+	fmt.Printf("fetched access token: %v \n", token.AccessToken)
+
+	platform := fakeopen.NewAiFakeOpenPlatform()
+	req := fakeopen.SharedTokenReq{
+		UniqueName:        uniqueName,
+		AccessToken:       token.AccessToken,
+		ExpiresIn:         0,
+		SiteLimit:         "",
+		ShowConversations: true,
+	}
+	shareToken, err := platform.GetSharedToken(req)
+	if err != nil {
+		return shareToken, errors.New("error getting shared token: " + err.Error())
+	}
+	return shareToken, nil
+
+}
+
+type RenewSharedTokenRFT struct {
+	OpenaiAccountEmail string
+	OpenaiRefreshToken string
+}
+
+// RenewSharedTokenWithRefreshToken
+//
+//	@Description: 使用refreshtoken 刷新shared token
+//	@receiver receiver
+//	@param renewSharedTokenRFTs
+//	@param uniqueName
+//	@return RenewResult
+//	@return error
+func (receiver *FakeOpenTokens) RenewSharedTokenWithRefreshToken(renewSharedTokenRFTs []RenewSharedTokenRFT, uniqueName string) (RenewResult, error) {
+	result := RenewResult{
+		RenewCount:   0,
+		RenewSuccess: false,
+	}
+	if len(renewSharedTokenRFTs) <= 0 {
+		log.Fatal("openai refresh token list is empty")
+	}
+	var er error
+	for index, account := range renewSharedTokenRFTs {
+		fmt.Printf("renew shared token progress...%v/%v. ", index+1, len(renewSharedTokenRFTs))
+		_, err := receiver.FetchSharedTokenWithRefreshToken(account.OpenaiAccountEmail, account.OpenaiRefreshToken, uniqueName)
+		if err == nil {
+			result.RenewCount += 1
+		} else {
+			er = err
+		}
+		time.Sleep(time.Second * 15)
+	}
+	//全部成功刷新
+	if len(renewSharedTokenRFTs) == result.RenewCount {
+		result.RenewSuccess = true
+	}
+	return result, er
+}
+
+// FetchPooledToken
+//
+//	@Description: 通过官方账号列表获取pooled token
+//	@receiver receiver
+//	@param openaiAccounts
+//	@return fakeopen.PooledToken
+//	@return error
+func (receiver *FakeOpenTokens) FetchPooledToken(openaiAccounts []OpenaiAccount, uniqueName string) (fakeopen.PooledToken, error) {
+	if len(openaiAccounts) <= 0 {
+		log.Fatal("invalid openai account list")
+	}
+	if len(openaiAccounts) > PooledTokenAccountsLimit {
+		log.Println("openai account size is greater than 100,do cut off to 100")
+	}
+	var shareTokens []string
+	for index, account := range openaiAccounts {
+		if index > PooledTokenAccountsLimit {
+			break
+		}
+		fmt.Printf("fetching pooled token progress...%v/%v. ", index+1, len(openaiAccounts))
+		token, err := receiver.FetchSharedToken(account, uniqueName)
+		//等待15秒
+		if err != nil {
+			log.Printf("error fetch shared token: %v \n", err)
+			log.Println("current account is: ", account.Email)
+		}
+		shareTokens = append(shareTokens, token.TokenKey)
+		time.Sleep(15 * time.Second)
+
+	}
+
+	platform := fakeopen.NewAiFakeOpenPlatform()
+	//tokens with shared token
+
+	req := fakeopen.PooledTokenReq{
+		ShareTokens: shareTokens,
+		PoolToken:   "",
+	}
+	token, err := platform.RenewPooledToken(req)
+	if err != nil {
+		return token, errors.New("error renewing pool token: " + err.Error())
+	}
+	return token, nil
+}
+
+// FetchPooledTokenWithRefreshToken
+//
+//	@Description: 使用openai 官方的refresh token 获取fakeopen的pool token
+//	@receiver receiver
+//	@param renewSharedTokenRFTs
+//	@param uniqueName
+//	@return fakeopen.PooledToken
+//	@return error
+func (receiver *FakeOpenTokens) FetchPooledTokenWithRefreshToken(renewSharedTokenRFTs []RenewSharedTokenRFT, uniqueName string) (fakeopen.PooledToken, error) {
+	if len(renewSharedTokenRFTs) <= 0 {
+		log.Fatal("invalid openai refreshToken list")
+	}
+	if len(renewSharedTokenRFTs) > PooledTokenAccountsLimit {
+		log.Println("openai account size is greater than 100,do cut off to 100")
+	}
+	var shareTokens []string
+	for index, account := range renewSharedTokenRFTs {
+		if index > PooledTokenAccountsLimit {
+			break
+		}
+		fmt.Printf("fetching pooled token progress...%v/%v. ", index+1, len(renewSharedTokenRFTs))
+		token, err := receiver.FetchSharedTokenWithRefreshToken(account.OpenaiAccountEmail, account.OpenaiRefreshToken, uniqueName)
+		//等待15秒
+		if err != nil {
+			log.Printf("error fetch shared token: %v \n", err)
+			log.Println("current account is: ", account.OpenaiAccountEmail)
+		}
+		shareTokens = append(shareTokens, token.TokenKey)
+		time.Sleep(15 * time.Second)
+
+	}
+
+	platform := fakeopen.NewAiFakeOpenPlatform()
+	//tokens with shared token
+
+	req := fakeopen.PooledTokenReq{
+		ShareTokens: shareTokens,
+		PoolToken:   "",
+	}
+	token, err := platform.RenewPooledToken(req)
+	if err != nil {
+		return token, errors.New("error renewing pool token: " + err.Error())
+	}
+	return token, nil
+}
+
+func (receiver *FakeOpenTokens) FetchMixedPooledToken(openaiAccounts []OpenaiAccount, openaiSkKeys []string, uniqueName string) (fakeopen.PooledToken, error) {
+	if len(openaiAccounts)+len(openaiSkKeys) <= 0 {
+		log.Fatal("invalid openai account list or sk keys")
+	}
+	if len(openaiAccounts)+len(openaiSkKeys) > PooledTokenAccountsLimit {
+		log.Println("openai account + openai sk keys size is greater than 100,do cut off to 100")
+	}
+	var shareTokens []string
+	for index, account := range openaiAccounts {
+		if index > PooledTokenAccountsLimit-len(openaiSkKeys) {
+			break
+		}
+		fmt.Printf("fetching pooled token progress...%v/%v. ", index+1, len(openaiAccounts))
+		token, err := receiver.FetchSharedToken(account, uniqueName)
+		//等待15秒
+		if err != nil {
+			log.Printf("error fetch shared token: %v \n", err)
+			log.Println("current account is: ", account.Email)
+		}
+		shareTokens = append(shareTokens, token.TokenKey)
+		time.Sleep(15 * time.Second)
+
+	}
+
+	//add sk keys to shareTokens
+	shareTokens = append(shareTokens, openaiSkKeys...)
+
+	platform := fakeopen.NewAiFakeOpenPlatform()
+	//tokens with shared token
+
+	req := fakeopen.PooledTokenReq{
+		ShareTokens: shareTokens,
+		PoolToken:   "",
+	}
+	token, err := platform.RenewPooledToken(req)
+	if err != nil {
+		return token, errors.New("error renewing pool token: " + err.Error())
+	}
+	return token, nil
+}
+
+func (receiver *FakeOpenTokens) FetchMixedPooledTokenWithRefreshToken(renewSharedTokenRFTs []RenewSharedTokenRFT, openaiSkKeys []string, uniqueName string) (fakeopen.PooledToken, error) {
+	if len(renewSharedTokenRFTs)+len(openaiSkKeys) <= 0 {
+		log.Fatal("invalid openai account list or sk keys")
+	}
+	if len(renewSharedTokenRFTs)+len(openaiSkKeys) > PooledTokenAccountsLimit {
+		log.Println("openai account + openai sk keys size is greater than 100,do cut off to 100")
+	}
+	var shareTokens []string
+	for index, account := range renewSharedTokenRFTs {
+		if index > PooledTokenAccountsLimit-len(openaiSkKeys) {
+			break
+		}
+		fmt.Printf("fetching pooled token progress...%v/%v. ", index+1, len(renewSharedTokenRFTs))
+		token, err := receiver.FetchSharedTokenWithRefreshToken(account.OpenaiAccountEmail, account.OpenaiRefreshToken, uniqueName)
+		//等待15秒
+		if err != nil {
+			log.Printf("error fetch shared token: %v \n", err)
+			log.Println("current account is: ", account.OpenaiAccountEmail)
+		}
+		shareTokens = append(shareTokens, token.TokenKey)
+		time.Sleep(15 * time.Second)
+
+	}
+
+	//add sk keys to shareTokens
+	shareTokens = append(shareTokens, openaiSkKeys...)
+
+	platform := fakeopen.NewAiFakeOpenPlatform()
+	//tokens with shared token
+
+	req := fakeopen.PooledTokenReq{
+		ShareTokens: shareTokens,
+		PoolToken:   "",
+	}
+	token, err := platform.RenewPooledToken(req)
+	if err != nil {
+		return token, errors.New("error renewing pool token: " + err.Error())
+	}
+	return token, nil
+}
+
+// FetchAccessTokenBySessionToken
+//
+//	@Description: 使用openai session token 获取accesstoken
+//	session token 有效期三个月
+//	@receiver receiver
+//	@param openaiSessionToken
+//	@return fakeopen.SessionToken
+//	@return error
+func (receiver *FakeOpenTokens) FetchAccessTokenBySessionToken(openaiSessionToken string) (fakeopen.SessionToken, error) {
+	platform := fakeopen.NewAiFakeOpenPlatform()
+	return platform.GetAccessTokenBySessionToken(openaiSessionToken)
 }
